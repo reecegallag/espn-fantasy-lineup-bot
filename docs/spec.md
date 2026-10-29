@@ -34,18 +34,19 @@ This leaves value on the table. A player expected back in 3 days should be pre-s
 - Exactly 5 minutes before the earliest game, the bot evaluates the user's roster priorities and adjusts active lineup slots automatically.
 - The Chrome Extension works passively as an autonomous bridge — provided the user enters a valid `licenseKey` and grants consent, it captures their session tokens when they log into `fantasy.espn.com` and `POST`s them directly to the companion Bot Server to maintain synchronization.
 
-### 2. Start/Bench Decision Logic (Priority Order)
+### 2. Start/Bench Decision Logic (Expected Points)
 
-For each game day, the extension fills active roster slots using this priority:
+Each player gets an **expected-points** score for the day (`src/core/projection.js`):
 
-1. **Healthy + has a game** — best option, always preferred
-2. **Injured + has a game** — some chance of scoring beats a guaranteed 0 from a rest day
-3. **Healthy + no game** — no points but available if nothing better
-4. **Injured + no game** — last resort
+`expected points = P(plays) x blended fantasy points per game`, and 0 if his team has no game.
 
-Within each tier, rank by **projected points / season averages**.
+- **Fantasy points per game** come from ESPN's `appliedAverage`, which is already computed with the league's own scoring settings. They are blended across last 7, last 15, last 30, season, and ESPN's preseason projection, leaning on recent form (weights in `SPLIT_WEIGHTS`).
+- **P(plays)** comes from injury status: Probable 0.95, Day-to-Day 0.6, Questionable 0.5, Doubtful 0.15, Out 0. On **future days** only Out-style statuses carry forward; everything else counts as healthy because status is unknowable that far ahead.
+- Players with no stats at all get a small positive fallback so healthy players with a game still start.
 
-> Return dates are NOT used in lineup decisions. Injured return dates get pushed back constantly and can't be trusted. Injury status is treated as a binary: injured or healthy.
+Starting slots are then filled with the **assignment that maximizes total expected points** (Hungarian algorithm, `src/core/assignment.js`), respecting each player's ESPN slot eligibility so flex slots (G, F, UTIL) and multi-position players are solved jointly. Players with 0 expected points (no game, ruled out) are benched; a slot with no eligible candidate stays empty. Ties prefer leaving a player in his current slot to avoid needless transactions.
+
+> Return dates are NOT used in lineup decisions. Injured return dates get pushed back constantly and can't be trusted.
 
 ### 3. IR Slot Strategy
 
@@ -73,9 +74,9 @@ Example: 3 players injured, 1 IR slot, return dates are Jan 10, Feb 1, Mar 15:
 Standard ESPN NBA roster slots: `PG, SG, SF, PF, C, G, F, UTIL, Bench×N, IR×N`
 
 Filling logic per game day:
-1. For each active slot (PG, SG, SF, PF, C, G, F, UTIL), find the best eligible player
-2. Rank candidates for each slot by priority tier (healthy+game > injured+game > healthy+no game > injured+no game), then by projected points within each tier
-5. Fill bench slots with remaining rostered players
+1. Score every player by expected points (see above)
+2. Assign players to the active slots (PG, SG, SF, PF, C, G, F, UTIL) to maximize total expected points
+3. Fill bench slots with remaining rostered players
 
 ---
 

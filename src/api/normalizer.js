@@ -8,7 +8,8 @@
  *   injuryStatus,       // 'OUT' for injured (raw ESPN 'O'/'IL' folded to 'OUT'); other raw codes pass through and are treated as healthy; null when absent
  *   lineupSlotId,       // current slot (basketball: 0=PG, 12=BENCH, 13=IR, …)
  *   eligibleSlots,      // int[]
- *   projectedPoints,    // float (0 if unavailable)
+ *   projectedPoints,    // float: blended fantasy points per game (0 if unavailable)
+ *   fpAverages,         // { season, last7, last15, last30, projected } fantasy points per game; keys absent when unavailable
  *   injuryDate          // injury onset date (ISO string) or null; ESPN exposes no projected return date
  * }
  *
@@ -20,6 +21,8 @@
  *   rosterSlots,        // { slotId: count }
  * }
  */
+
+import { blendedFpPerGame } from '../core/projection.js';
 
 export function normalizeLeague(raw) {
   const settings = extractSettings(raw);
@@ -44,7 +47,39 @@ function extractSettings(raw) {
   };
 }
 
+// ESPN stat split ids: 0 = full season, 1 = last 7, 2 = last 15, 3 = last 30.
+// statSourceId: 0 = actual stats, 1 = ESPN projections. (From ESPN's payload conventions;
+// verify against a live response if values look off.)
+const SPLIT_NAMES = { 0: 'season', 1: 'last7', 2: 'last15', 3: 'last30' };
+
+/**
+ * Pull per-game fantasy point averages for the current season out of a player's stat entries.
+ * ESPN's `appliedAverage` is already computed with the league's scoring settings.
+ * Entries may sit on the player or on the pool entry, so both are searched.
+ *
+ * @returns {{season?: number, last7?: number, last15?: number, last30?: number, projected?: number}}
+ */
+function extractFpAverages(playerData, poolEntry, seasonId) {
+  const entries = [...(playerData.stats ?? []), ...(poolEntry.stats ?? [])];
+  const out = {};
+  for (const s of entries) {
+    if (s == null || s.appliedAverage == null) continue;
+    if (seasonId != null && s.seasonId != null && Number(s.seasonId) !== Number(seasonId)) continue;
+    const value = Number(s.appliedAverage);
+    if (!Number.isFinite(value)) continue;
+
+    if (s.statSourceId === 1) {
+      if (s.statSplitTypeId === 0 && out.projected === undefined) out.projected = value;
+      continue;
+    }
+    const name = SPLIT_NAMES[s.statSplitTypeId];
+    if (name && out[name] === undefined) out[name] = value;
+  }
+  return out;
+}
+
 function extractPlayers(raw) {
+  const seasonId = raw.seasonId ?? null;
   const players = [];
 
   for (const team of raw.teams || []) {
@@ -66,15 +101,10 @@ function extractPlayers(raw) {
         injuryStatus = 'OUT';
       }
 
-      // Projected points from onTeamRoster stats (season average)
-      let projectedPoints = 0;
-      const stats = poolEntry.stats ?? [];
-      for (const s of stats) {
-        if (s.statSplitTypeId === 1 && s.seasonId && s.appliedTotal != null) {
-          projectedPoints = s.appliedAverage ?? s.appliedTotal ?? 0;
-          break;
-        }
-      }
+      // Fantasy points per game by split, already scored with the league's settings.
+      const fpAverages = extractFpAverages(playerData, poolEntry, seasonId);
+      // Legacy single number (blend of the splits); the optimizer reads fpAverages directly.
+      const projectedPoints = blendedFpPerGame(fpAverages) ?? 0;
 
       // Injury onset date from the pool entry. ESPN's roster payload does not
       // expose a projected return date, so this is the only injury-timing signal.
@@ -89,6 +119,7 @@ function extractPlayers(raw) {
         lineupSlotId: entry.lineupSlotId,
         eligibleSlots: Array.isArray(eligibleSlots) ? eligibleSlots : [],
         projectedPoints: Number(projectedPoints) || 0,
+        fpAverages,
         injuryDate,
       });
     }

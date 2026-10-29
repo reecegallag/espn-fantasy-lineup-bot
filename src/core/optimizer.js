@@ -1,17 +1,25 @@
 /**
  * Per-day lineup optimizer.
  *
- * Priority tiers (lower = better):
- *   Tier 1: healthy + has game
- *   Tier 2: injured + has game
- *   Tier 3: healthy + no game
- *   Tier 4: injured + no game
+ * Each rostered player gets an expected-points score for the period
+ * (see projection.js): P(plays) x blended fantasy points per game, and 0 if his
+ * team has no game. Starting slots are then filled with the assignment that
+ * maximizes total expected points, respecting ESPN's per-player slot eligibility
+ * (so multi-position players and the G / F / UTIL flex slots are handled jointly,
+ * not one slot at a time).
  *
- * "Injured" = injuryStatus === 'OUT' only.
- * DOUBTFUL / QUESTIONABLE / PROBABLE / null → healthy.
+ * Players with 0 expected points (no game, or ruled out) are never started.
+ * A slot with no eligible candidate stays empty.
  */
 
 import { SLOT, isEligibleForSlot } from '../utils/slot-utils.js';
+import { expectedPoints } from './projection.js';
+import { minCostAssignment } from './assignment.js';
+
+/** Ineligible slot/player pairs cost this much; the empty-slot columns always beat it. */
+const INELIGIBLE = 1e6;
+/** Nudge toward leaving a player where he already is, so ties don't churn transactions. */
+const STAY_BONUS = 0.05;
 
 /**
  * Build lineup items for a single scoring period.
@@ -29,32 +37,44 @@ export function optimizeLineup(activePlayers, irPlayers, playingTeamIds, scoring
   const currentSlotOf = player => currentSlots.get(player.playerId) ?? player.lineupSlotId;
   // ESPN rejects IR transactions on future days, so a player already in IR there is untouchable.
   const isFutureIr = slotId => scoringPeriodId > currentScoringPeriodId && slotId === SLOT.IR;
+  const isToday = scoringPeriodId <= currentScoringPeriodId;
 
-  // Annotate each active player with tier
-  const annotated = activePlayers.map(p => ({
+  const scored = activePlayers.map(p => ({
     ...p,
-    tier: computeTier(p, playingTeamIds),
+    expected: expectedPoints(p, { playsToday: playingTeamIds.has(p.proTeamId), isToday }),
   }));
 
-  // Sort: tier ASC, projectedPoints DESC
-  annotated.sort((a, b) =>
-    a.tier !== b.tier ? a.tier - b.tier : b.projectedPoints - a.projectedPoints
-  );
+  // Only players expected to score, and not stuck on a future-day IR slot, compete for starting slots.
+  const candidates = scored.filter(p => p.expected > 0 && !isFutureIr(currentSlotOf(p)));
 
   const assignments = []; // { slotId, player } — array so multiple same-slotId entries survive
   const usedPlayerIds = new Set();
 
-  // Greedily fill active slots
-  for (const slotId of activeSlots) {
-    for (const player of annotated) {
-      if (usedPlayerIds.has(player.playerId)) continue;
-      if (isFutureIr(currentSlotOf(player))) continue; // can't pull players off IR on future days
-      if (!isEligibleForSlot(player, slotId)) continue;
-      assignments.push({ slotId, player });
+  const slotCount = activeSlots.length;
+  if (slotCount > 0 && candidates.length > 0) {
+    // Columns: every candidate, then one "leave this slot empty" column per slot (cost 0).
+    const cols = candidates.length + slotCount;
+    const cost = activeSlots.map(slotId => {
+      const row = new Array(cols).fill(0);
+      candidates.forEach((player, j) => {
+        if (!isEligibleForSlot(player, slotId)) {
+          row[j] = INELIGIBLE;
+          return;
+        }
+        const stay = currentSlotOf(player) === slotId ? STAY_BONUS : 0;
+        row[j] = -(player.expected + stay);
+      });
+      return row;
+    });
+
+    const rowToCol = minCostAssignment(cost);
+    rowToCol.forEach((col, row) => {
+      if (col < 0 || col >= candidates.length) return; // empty-slot column
+      const player = candidates[col];
+      if (cost[row][col] >= INELIGIBLE) return;
+      assignments.push({ slotId: activeSlots[row], player });
       usedPlayerIds.add(player.playerId);
-      break;
-    }
-    // If no candidate found, slot stays empty (no item emitted)
+    });
   }
 
   const items = [];
@@ -70,7 +90,7 @@ export function optimizeLineup(activePlayers, irPlayers, playingTeamIds, scoring
   }
 
   // Bench: unassigned active players
-  for (const player of annotated) {
+  for (const player of scored) {
     if (usedPlayerIds.has(player.playerId)) continue;
     if (isFutureIr(currentSlotOf(player))) continue; // stuck on IR for a future day — leave them there
     items.push({
@@ -95,14 +115,4 @@ export function optimizeLineup(activePlayers, irPlayers, playingTeamIds, scoring
 
   // Filter out NO-OP moves to prevent TRAN_INVALID_SCORINGPERIOD_NOT_CURRENT on future days
   return items.filter(item => item.fromLineupSlotId !== item.toLineupSlotId);
-}
-
-function computeTier(player, playingTeamIds) {
-  const isInjured = player.injuryStatus === 'OUT';
-  const hasGame = playingTeamIds.has(player.proTeamId);
-
-  if (!isInjured && hasGame) return 1;
-  if (isInjured && hasGame) return 2;
-  if (!isInjured && !hasGame) return 3;
-  return 4; // injured + no game
 }
